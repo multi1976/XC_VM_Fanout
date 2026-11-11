@@ -55,3 +55,32 @@ func TestAnErrorPageIsNotAFormatRefusal(t *testing.T) {
 		})
 	}
 }
+
+// TestAnErrorPageSaysWhy: the refusal carries the page's own words, so the log
+// tells a channel the provider has removed ("Stream ID doesn't exist.") from an
+// account over its limit — the first wants the source replaced, the second a
+// retry. The style sheet XUI.one puts before its message is not the message,
+// and a URL the page echoes stays out of the log.
+func TestAnErrorPageSaysWhy(t *testing.T) {
+	page := `<html><head><title>XUI.one - Debug Mode</title><link href="https://fonts.example/css" rel="stylesheet"><style>` +
+		strings.Repeat("#notfound .notfound{position:absolute;left:50%}", 40) +
+		`</style></head><body><div id="notfound"><div class="notfound"><h1>Stream ID doesn&#39;t exist.</h1>` +
+		`<p>Requested http://host/live/user/pass/70.ts</p></div></div></body></html>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+		_, _ = io.WriteString(w, page)
+	}))
+	defer srv.Close()
+
+	_, err := Open(context.Background(), srv.URL+"/live/user/pass/70", Options{})
+	if err == nil {
+		t.Fatal("Open accepted an error page as a stream")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "a web page, not a stream (XUI.one - Debug Mode: Stream ID doesn't exist.") {
+		t.Fatalf("err = %q, want the page title and message", msg)
+	}
+	if strings.Contains(msg, "position:absolute") || strings.Contains(msg, "user/pass") {
+		t.Fatalf("err = %q carries the style sheet or the echoed account", msg)
+	}
+}

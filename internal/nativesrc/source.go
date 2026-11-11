@@ -35,11 +35,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -408,7 +410,7 @@ func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCl
 	case looksLikePlaylist(head):
 		return adoptHLS(ctx, final, opt, head, body)
 	}
-	_ = body.Close()
+	defer body.Close()
 	if n == 0 {
 		// 200 and then not one byte is a source that is DOWN, not a source in
 		// another container: an origin blip, a backend restart, an account
@@ -427,6 +429,11 @@ func AdoptHTTP(ctx context.Context, resp *http.Response, opt Options) (io.ReadCl
 		// ffmpeg cannot play an HTML page either, so moving the stream onto its
 		// fallback for the life of the spec buys nothing and loses the native
 		// path once the account comes back.
+		// Say what the page says: "Stream ID doesn't exist." and "max connections"
+		// call for very different things from whoever reads the log.
+		if why := pageReason(head, body); why != "" {
+			return nil, fmt.Errorf("%w: %s: a web page, not a stream (%s)", ErrUnsupportedSource, redactURL(final), why)
+		}
 		return nil, fmt.Errorf("%w: %s: a web page, not a stream", ErrUnsupportedSource, redactURL(final))
 	}
 	return nil, fmt.Errorf("%w: %s: not an mpegts stream or a playlist", ErrFormat, redactURL(final))
@@ -522,6 +529,63 @@ func looksLikeErrorPage(contentType string, head []byte) bool {
 	}
 	h := bytes.TrimLeft(head, "\xef\xbb\xbf \t\r\n")
 	return len(h) > 0 && h[0] == '<'
+}
+
+// pageReasonMax bounds what is read of an error page and what is kept of its
+// text: enough for the message, never a page's worth in a log line.
+const (
+	pageReasonRead = 8 << 10
+	pageReasonMax  = 160
+)
+
+var (
+	pageDropRe  = regexp.MustCompile(`(?is)<(style|script|noscript)\b.*?</(style|script|noscript)\s*>`)
+	pageTitleRe = regexp.MustCompile(`(?is)<title\b[^>]*>(.*?)</title\s*>`)
+	pageTagRe   = regexp.MustCompile(`(?s)<[^>]*>`)
+	pageURLRe   = regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://\S+`)
+	pageSpaceRe = regexp.MustCompile(`\s+`)
+)
+
+// pageReason is the text an error page shows, as one short line: the panel's
+// own words for why it refused (an XUI.one page in debug mode says "Stream ID
+// doesn't exist.", others "Max connections reached"). head is what the sniff
+// already read; at most pageReasonRead more bytes are taken from body, which
+// the caller closes. URLs in the text are dropped, so a page that echoes the
+// request cannot put an account into the log.
+func pageReason(head []byte, body io.Reader) string {
+	page := head
+	if len(page) < pageReasonRead {
+		more, _ := io.ReadAll(io.LimitReader(body, int64(pageReasonRead-len(page))))
+		page = append(append([]byte(nil), page...), more...)
+	}
+	doc := string(page)
+	title := ""
+	if m := pageTitleRe.FindStringSubmatch(doc); m != nil {
+		title = cleanPageText(m[1])
+		doc = strings.Replace(doc, m[0], " ", 1)
+	}
+	text := cleanPageText(pageDropRe.ReplaceAllString(doc, " "))
+	if title != "" && text != "" && !strings.HasPrefix(text, title) {
+		text = title + ": " + text
+	} else if text == "" {
+		text = title
+	}
+	if r := []rune(text); len(r) > pageReasonMax {
+		text = string(r[:pageReasonMax]) + "…"
+	}
+	return text
+}
+
+func cleanPageText(s string) string {
+	s = html.UnescapeString(pageTagRe.ReplaceAllString(s, " "))
+	s = pageURLRe.ReplaceAllString(s, "(url)")
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)
+	return strings.TrimSpace(pageSpaceRe.ReplaceAllString(s, " "))
 }
 
 // prefixedReadCloser replays already-consumed bytes ahead of the live body while
