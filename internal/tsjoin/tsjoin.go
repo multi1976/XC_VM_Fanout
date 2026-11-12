@@ -132,6 +132,15 @@ type State struct {
 	// into ~zero. Capped at defaults.JoinFreeGOPBufs; buffers hold len 0, cap kept.
 	freeBufs [][]byte
 
+	// gopEst is what the next block is expected to hold (bytes): a smoothed
+	// size of the blocks this stream has closed. A new block's array is made
+	// that big (plus gopSlack), a recycled array is reused only when it fits it,
+	// and a block that closes well under its array is fitted (trimClosing).
+	// Recycling arrays with their capacity kept let them creep up to the
+	// largest GOPs a stream had shown: a live node's rings held 1.6x their
+	// bytes, and a stream with frequent scene changes 3x.
+	gopEst int
+
 	// prunedID / prunedLen are the id and final length of the newest block to
 	// leave the ring (prunedID -1 = none yet). A block is final once a newer one
 	// opens, so a reader whose cursor sits at prunedLen in prunedID took every byte
@@ -427,7 +436,7 @@ func (s *State) Update(chunk []byte) {
 					s.hlsOnKeyframe(id, pts)
 				}
 			}
-			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), t: t, pts: pts, video: onVideo})
+			s.gops = append(s.gops, gop{id: id, data: append(s.newBlockBuf(), pkt...), t: t, pts: pts, video: onVideo})
 			s.prune()
 		case len(s.gops) > 0 && len(s.gops[len(s.gops)-1].data)+PacketSize <= s.maxGOP:
 			g := &s.gops[len(s.gops)-1]
@@ -463,7 +472,7 @@ func (s *State) Update(chunk []byte) {
 			s.clockStep = 0
 			id := s.nextGOPID
 			s.nextGOPID++
-			s.gops = append(s.gops, gop{id: id, data: append(s.getBuf(), pkt...), t: s.ringClock(), pts: -1})
+			s.gops = append(s.gops, gop{id: id, data: append(s.newBlockBuf(), pkt...), t: s.ringClock(), pts: -1})
 			s.prune()
 		}
 	}
@@ -1125,6 +1134,7 @@ func (s *State) Reset() {
 	s.gops = nil
 	s.segs = nil
 	s.freeBufs = nil
+	s.gopEst = 0 // a new source: its blocks are learnt afresh
 	s.segStartID, s.segLastPTS, s.segSpan = -1, -1, 0
 	// Whatever the producer sends next follows a gap: its first segment is a
 	// discontinuity to anyone who saw the ones before.
@@ -1212,6 +1222,79 @@ func readPCR(pkt []byte) int64 {
 
 func cloneInto(dst, src []byte) []byte {
 	return append(dst[:0], src...)
+}
+
+// gopSlack is the room a block's array gets over the expected size (1/8). A
+// GOP that outgrows it grows by append as before, for that block only, and is
+// fitted when it closes if that left it well over.
+const gopSlack = 8
+
+// newBlockBuf is the array for a block about to open, sized for what the
+// stream's blocks have held (gopEst, which it updates from the block now
+// closing, and fits that block — see trimClosing). A recycled array is reused
+// when its capacity fits that size — not under it, not more than half over —
+// and one far off it is let go, so the free list does not keep arrays the
+// stream's blocks no longer need. Before the stream has closed a block, it
+// behaves as before (recycled or nil). Caller (Hub) serialises access.
+func (s *State) newBlockBuf() []byte {
+	if n := len(s.gops); n > 0 {
+		last := len(s.gops[n-1].data)
+		if s.gopEst == 0 {
+			s.gopEst = last
+		} else {
+			s.gopEst += (last - s.gopEst) / 4 // smoothed over the last few blocks
+		}
+		s.trimClosing(&s.gops[n-1])
+	}
+	need := s.gopEst
+	if need <= 0 {
+		return s.getBuf()
+	}
+	for i := len(s.freeBufs) - 1; i >= 0; i-- {
+		c := cap(s.freeBufs[i])
+		if c >= need && c <= need+need/2 {
+			b := s.freeBufs[i]
+			s.dropFreeBuf(i)
+			return b[:0]
+		}
+		if c > 2*need || c < need/2 {
+			s.dropFreeBuf(i) // far off: give it back to the GC
+		}
+	}
+	size := need + need/gopSlack
+	if size > s.maxGOP {
+		size = s.maxGOP
+	}
+	size = (size + PacketSize - 1) / PacketSize * PacketSize
+	return make([]byte, 0, size)
+}
+
+// trimClosing fits the array of the block that is closing to what it holds
+// when it is well over (a GOP smaller than the estimate, or one that grew by
+// append): the bytes move to an array of their own size and the big one goes
+// to the free list for the next block. A reader holding the block keeps the
+// old array through its slices; offsets in the block are unchanged.
+func (s *State) trimClosing(g *gop) {
+	l, c := len(g.data), cap(g.data)
+	if c-l <= l/4 || c-l < 64<<10 {
+		return
+	}
+	fit := make([]byte, l, l+l/16)
+	copy(fit, g.data)
+	old := g.data
+	g.data = fit
+	if s.pinned[g.id] == 0 {
+		s.putBuf(old)
+	}
+}
+
+// dropFreeBuf takes entry i off the free list, clearing the slot it vacates so
+// the list's spare capacity cannot keep that array alive.
+func (s *State) dropFreeBuf(i int) {
+	last := len(s.freeBufs) - 1
+	copy(s.freeBufs[i:], s.freeBufs[i+1:])
+	s.freeBufs[last] = nil
+	s.freeBufs = s.freeBufs[:last]
 }
 
 // getBuf returns a recycled GOP data buffer (length 0, capacity preserved), or a
