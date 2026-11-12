@@ -16,18 +16,25 @@ const memoryReportTop = 10
 
 // ringView is one stream's ring in the memory report.
 type ringView struct {
-	ID      string  `json:"id"`
-	Bytes   int     `json:"bytes"`
-	Seconds float64 `json:"seconds"` // stream time the ring spans
-	GOPs    int     `json:"gops"`
-	Viewers int     `json:"viewers"`
-	Gated   bool    `json:"gated"` // collapsed to the idle floor (no viewers)
+	ID    string `json:"id"`
+	Bytes int    `json:"bytes"`
+	// The memory those bytes sit in: a block's array grows by append, so it can
+	// hold up to twice what it fills.
+	CapacityBytes int     `json:"capacity_bytes"`
+	Seconds       float64 `json:"seconds"` // stream time the ring spans
+	GOPs          int     `json:"gops"`
+	Viewers       int     `json:"viewers"`
+	Gated         bool    `json:"gated"` // collapsed to the idle floor (no viewers)
 }
 
 // memoryView is GET /memory: where this daemon's memory is.
 type memoryView struct {
 	Streams   int   `json:"streams"`
 	RingBytes int64 `json:"ring_bytes"` // every stream's ring together
+	// What the rings' block arrays hold (capacity, not length), and the recycled
+	// arrays kept for the next GOPs: together the memory the rings really take.
+	RingCapacityBytes int64 `json:"ring_capacity_bytes"`
+	RingFreeBufBytes  int64 `json:"ring_free_buf_bytes"`
 	// From runtime/metrics, which — unlike runtime.ReadMemStats — does not stop
 	// the world, so this is safe to poll on a busy node.
 	HeapInUseBytes uint64     `json:"heap_in_use_bytes"` // heap objects, live and not yet swept
@@ -58,13 +65,16 @@ func (m *Manager) serveMemory(w http.ResponseWriter, r *http.Request) {
 	rings := make([]ringView, 0, len(streams))
 	for _, st := range streams {
 		bytes, spanMS, gops := st.Hub.RingStats()
+		capBytes, freeBytes := st.Hub.RingCapacity()
+		out.RingCapacityBytes += int64(capBytes)
+		out.RingFreeBufBytes += int64(freeBytes)
 		st.mu.Lock()
 		gated := !st.buffered
 		viewers := st.refs // live-TS followers (ADR 0004: viewers follow the ring, no Sub to count)
 		st.mu.Unlock()
 		out.RingBytes += int64(bytes)
 		rings = append(rings, ringView{
-			ID: st.id, Bytes: bytes, Seconds: float64(spanMS) / 1000, GOPs: gops,
+			ID: st.id, Bytes: bytes, CapacityBytes: capBytes, Seconds: float64(spanMS) / 1000, GOPs: gops,
 			Viewers: viewers, Gated: gated,
 		})
 	}

@@ -56,6 +56,16 @@ func TestMemoryReportsTheRings(t *testing.T) {
 	if v.RingBytes != sum {
 		t.Errorf("ring_bytes %d, want the sum of the rings %d", v.RingBytes, sum)
 	}
+	var capSum int64
+	for _, r := range v.Largest {
+		if r.CapacityBytes < r.Bytes {
+			t.Errorf("ring %s: capacity %d below its %d bytes", r.ID, r.CapacityBytes, r.Bytes)
+		}
+		capSum += int64(r.CapacityBytes)
+	}
+	if v.RingCapacityBytes != capSum || v.RingCapacityBytes < v.RingBytes {
+		t.Errorf("ring_capacity_bytes %d, want the sum of the rings' %d and at least ring_bytes %d", v.RingCapacityBytes, capSum, v.RingBytes)
+	}
 	if v.HeapInUseBytes == 0 || v.MappedBytes == 0 {
 		t.Errorf("heap figures missing: %+v", v)
 	}

@@ -335,6 +335,14 @@ func (h *Hub) CloseAll() {
 	h.mu.Unlock()
 }
 
+// RingCapacity reports the memory the join ring's blocks hold (their arrays'
+// capacity) and that of its recycled block arrays.
+func (h *Hub) RingCapacity() (capBytes, freeBytes int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.join.RingCapacity()
+}
+
 // RingStats reports the join ring's bytes, span (ms) and GOP count.
 func (h *Hub) RingStats() (bytes int, spanMS int64, gops int) {
 	h.mu.Lock()

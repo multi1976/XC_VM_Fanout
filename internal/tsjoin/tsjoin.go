@@ -1146,6 +1146,21 @@ func (s *State) RingStats() (bytes int, spanMS int64, gops int) {
 	return bytes, spanMS, len(s.gops)
 }
 
+// RingCapacity reports the memory the ring's blocks hold, beside the bytes they
+// fill (RingStats): a block grows by append, so its array can be up to twice its
+// length, and the recycled arrays waiting in freeBufs keep theirs. capBytes is
+// the arrays of the blocks in the ring, freeBytes those of the recycled ones.
+// Caller (Hub) serialises access.
+func (s *State) RingCapacity() (capBytes, freeBytes int) {
+	for i := range s.gops {
+		capBytes += cap(s.gops[i].data)
+	}
+	for _, b := range s.freeBufs {
+		freeBytes += cap(b)
+	}
+	return capBytes, freeBytes
+}
+
 // Pin is a reader's hold on the blocks its slices point into (ids lo..hi), taken
 // by ReadFrom, SnapshotPin or HLSSegmentPin and given back with Unpin, exactly
 // once. The zero Pin holds nothing.
